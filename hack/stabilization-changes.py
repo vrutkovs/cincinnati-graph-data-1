@@ -39,80 +39,97 @@ def parse_iso8601_delay(delay):
     return datetime.timedelta(days=7*weeks, hours=hours)
 
 
+def create_pull_request(paths, name, version, feeder, promotion, version_delay, public_errata_message, github_repo, github_token):
+    path_without_extension, _ = os.path.splitext(paths[name])
+    subject = '{}: Promote {}'.format(path_without_extension, version)
+    body = 'It was promoted to the feeder {} by {} ({}, {}) {} ago.{}'.format(
+            feeder,
+            promotion['hash'][:10],
+            promotion['summary'],
+            promotion['committer-time'].date().isoformat(),
+            version_delay,
+            public_errata_message,
+        )
+    try:
+        pull = promote(
+            version=version,
+            channel=name,
+            path=paths[name],
+            subject=subject,
+            body=body,
+            github_repo=github_repo,
+            github_token=github_token)
+    except Exception as error:
+        _LOGGER.error('  failed to promote {} to {}: {}'.format(version, name, error))
+        return 'FAILED {}. {} {}'.format(subject, body, error)
+    else:
+        return '{}. {} {}'.format(subject, body, pull.html_url)
+
+
+def stabilize_candidate(promotions, version, feeder, cache, path, github_repo, github_token):
+    notifications = []
+    promotion = promotions[version]
+    version_delay = now - promotion['committer-time']
+    errata_public = False
+    public_errata_message = ''
+    if errata:
+        errata_uri, errata_public = public_errata_uri(version=version, channel=feeder, cache=cache)
+        if errata_uri:
+            public_errata_message = ' {} is{} public.'.format(errata_uri, '' if errata_public else ' not')
+    if version_delay > delay or errata_public:
+        notifications.append(create_pull_request(paths, name, version, feeder, promotion, version_delay, public_errata_message, github_repo, github_token))
+    else:
+        _LOGGER.info('  waiting: {} ({}){}'.format(version, version_delay, public_errata_message))
+        if waiting_notifications:
+            notifications.append(
+                'Recommend waiting to promote {} to {}; it was promoted the feeder {} by {} ({}, {}, {}){}'.format(
+                    version,
+                    name,
+                    feeder,
+                    promotion['hash'][:10],
+                    promotion['summary'],
+                    promotion['committer-time'].date().isoformat(),
+                    version_delay,
+                    public_errata_message,
+                )
+            )
+
+
+def stabilize_channel(name, channel, cache, paths, github_repo, github_token):
+    notifications = []
+    if not channel.get('feeder'):
+        continue
+    feeder = channel['feeder']['name']
+    delay_string = channel['feeder']['delay']
+    errata = channel['feeder'].get('errata')
+    if errata is not None and errata != 'public':
+        raise ValueError('invalid errata value for {}: {}', channel, errata)
+
+    delay = parse_iso8601_delay(delay=delay_string)
+    version_filter = re.compile('^{}$'.format(channel['feeder'].get('filter', '.*')))
+    feeder_data = channels[feeder]
+    unpromoted = set(feeder_data['versions']) - set(channel['versions']) - set(feeder_data.get('tombstones', {}))
+    candidates = set(v for v in unpromoted if version_filter.match(v))
+    if not candidates:
+        continue
+    promotions = get_promotions(paths[feeder])
+    now = datetime.datetime.now()
+    suffix = ''
+    if errata:
+        suffix = ' or the errata is published'
+    _LOGGER.info('considering promotions from {} to {} after {}{}'.format(feeder, name, delay_string, suffix))
+    for version in sorted(candidates):
+        notifications += stabilize_candidate(promotions, version, feeder, cache, paths, github_repo, github_token)
+    return notifications
+
+
 def stabilization_changes(directory, github_repo=None, github_token=None, webhook=None, waiting_notifications=False):
     channels, paths = load_channels(directory=directory)
     cache = {}
     notifications = []
     for name, channel in sorted(channels.items()):
-        if not channel.get('feeder'):
-            continue
-        feeder = channel['feeder']['name']
-        delay_string = channel['feeder']['delay']
-        errata = channel['feeder'].get('errata')
-        if errata is not None and errata != 'public':
-            raise ValueError('invalid errata value for {}: {}', channel, errata)
-        delay = parse_iso8601_delay(delay=delay_string)
-        version_filter = re.compile('^{}$'.format(channel['feeder'].get('filter', '.*')))
-        feeder_data = channels[feeder]
-        unpromoted = set(feeder_data['versions']) - set(channel['versions']) - set(feeder_data.get('tombstones', {}))
-        candidates = set(v for v in unpromoted if version_filter.match(v))
-        if not candidates:
-            continue
-        promotions = get_promotions(paths[feeder])
-        now = datetime.datetime.now()
-        suffix = ''
-        if errata:
-            suffix = ' or the errata is published'
-        _LOGGER.info('considering promotions from {} to {} after {}{}'.format(feeder, name, delay_string, suffix))
-        for version in sorted(candidates):
-            promotion = promotions[version]
-            version_delay = now - promotion['committer-time']
-            errata_public = False
-            public_errata_message = ''
-            if errata:
-                errata_uri, errata_public = public_errata_uri(version=version, channel=feeder, cache=cache)
-                if errata_uri:
-                    public_errata_message = ' {} is{} public.'.format(errata_uri, '' if errata_public else ' not')
-            if version_delay > delay or errata_public:
-                path_without_extension, _ = os.path.splitext(paths[name])
-                subject = '{}: Promote {}'.format(path_without_extension, version)
-                body = 'It was promoted to the feeder {} by {} ({}, {}) {} ago.{}'.format(
-                        feeder,
-                        promotion['hash'][:10],
-                        promotion['summary'],
-                        promotion['committer-time'].date().isoformat(),
-                        version_delay,
-                        public_errata_message,
-                    )
-                try:
-                    pull = promote(
-                        version=version,
-                        channel=name,
-                        path=paths[name],
-                        subject=subject,
-                        body=body,
-                        github_repo=github_repo,
-                        github_token=github_token)
-                except Exception as error:
-                    _LOGGER.error('  failed to promote {} to {}: {}'.format(version, name, error))
-                    notifications.append('FAILED {}. {} {}'.format(subject, body, error))
-                else:
-                    notifications.append('{}. {} {}'.format(subject, body, pull.html_url))
-            else:
-                _LOGGER.info('  waiting: {} ({}){}'.format(version, version_delay, public_errata_message))
-                if waiting_notifications:
-                    notifications.append(
-                        'Recommend waiting to promote {} to {}; it was promoted the feeder {} by {} ({}, {}, {}){}'.format(
-                            version,
-                            name,
-                            feeder,
-                            promotion['hash'][:10],
-                            promotion['summary'],
-                            promotion['committer-time'].date().isoformat(),
-                            version_delay,
-                            public_errata_message,
-                        )
-                    )
+        new_notifications = stabilize_channel(name, channel, cache, paths, github_repo, github_token)
+        notifications += new_notifications
     if notifications:
         notify(message='* ' + ('\n* '.join(notifications)), webhook=webhook)
 
